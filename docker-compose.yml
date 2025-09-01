@@ -1,0 +1,161 @@
+# docker-compose.yml
+version: "3.8"
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.1
+    container_name: trend_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - trend-net
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.1
+    container_name: trend_kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Increase heap if needed:
+      # KAFKA_HEAP_OPTS: "-Xmx512M -Xms512M"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - trend-net
+    restart: unless-stopped
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: trend_timescaledb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trends
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db/timescaledb-init.sql:/docker-entrypoint-initdb.d/timescaledb-init.sql:ro
+    networks:
+      - trend-net
+    restart: unless-stopped
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.2
+    container_name: trend_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - trend-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sS http://localhost:9200/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: trend_simulator
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - KAFKA_TOPIC=raw-events
+    depends_on:
+      - kafka
+    networks:
+      - trend-net
+    restart: unless-stopped
+
+  processor:
+    build:
+      context: ./processor
+      dockerfile: Dockerfile
+    container_name: trend_processor
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - INPUT_TOPIC=raw-events
+      - OUTPUT_TOPIC=processed-events
+      - POSTGRES_HOST=timescaledb
+      - POSTGRES_DB=trends
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    depends_on:
+      - kafka
+      - timescaledb
+      - elasticsearch
+    networks:
+      - trend-net
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: trend_api
+    environment:
+      - PORT=4000
+      - KAFKA_BROKER=kafka:9092
+      - POSTGRES_HOST=timescaledb
+      - POSTGRES_DB=trends
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    ports:
+      - "4000:4000"
+    depends_on:
+      - kafka
+      - timescaledb
+      - elasticsearch
+    networks:
+      - trend-net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: trend_frontend
+    environment:
+      - NEXT_PUBLIC_API_URL=http://api:4000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    networks:
+      - trend-net
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
+  pg-data:
+  es-data:
+
+networks:
+  trend-net:
+    driver: bridge
